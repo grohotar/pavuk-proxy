@@ -145,6 +145,9 @@ async def proxy_subscription(short_uuid: str, request: Request):
                 headers={
                     "User-Agent": user_agent,
                     "Accept": request.headers.get("Accept", "*/*"),
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "subs.pavuka.cv",
+                    "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
                 },
                 timeout=30.0
             )
@@ -199,6 +202,9 @@ async def proxy_subscription_path(short_uuid: str, path: str, request: Request):
                 headers={
                     "User-Agent": request.headers.get("User-Agent", ""),
                     "Accept": request.headers.get("Accept", "*/*"),
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "subs.pavuka.cv",
+                    "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
                 },
                 timeout=30.0
             )
