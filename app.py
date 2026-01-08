@@ -17,7 +17,7 @@ app = FastAPI(title="Subscription Proxy", version="1.0.0")
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "http://127.0.0.1:3011")
 BALANCER_NAME = os.getenv("BALANCER_NAME", "🇵🇱 Польша")
 PROBE_URL = os.getenv("PROBE_URL", "https://www.google.com/generate_204")
-PROBE_INTERVAL = os.getenv("PROBE_INTERVAL", "1m")
+PROBE_INTERVAL = os.getenv("PROBE_INTERVAL", "10s")
 
 
 def build_balancer_config(configs: list) -> dict:
