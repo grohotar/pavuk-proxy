@@ -95,7 +95,7 @@ def build_balancer_config(configs: list) -> dict:
                     "tag": "balancer",
                     "selector": balancer_selectors,
                     "strategy": {
-                        "type": "leastPing"
+                        "type": "random"
                     }
                 }
             ],
