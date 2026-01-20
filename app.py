@@ -175,8 +175,14 @@ async def proxy_subscription(short_uuid: str, request: Request):
             # Multiple configs - combine into balancer
             balancer_config = build_balancer_config(configs)
             if balancer_config:
+                # Copy important headers from upstream
+                headers = {}
+                for header_name in ['profile-title', 'profile-update-interval', 'subscription-userinfo', 'profile-web-page-url', 'support-url']:
+                    if header_name in upstream_response.headers:
+                        headers[header_name] = upstream_response.headers[header_name]
+                
                 # Return as array with single config (Happ expects array)
-                return JSONResponse(content=[balancer_config])
+                return JSONResponse(content=[balancer_config], headers=headers)
         
         # Single config or failed - return as is
         return Response(
