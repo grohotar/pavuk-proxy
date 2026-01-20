@@ -17,7 +17,7 @@ app = FastAPI(title="Subscription Proxy", version="1.0.0")
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "http://127.0.0.1:3011")
 BALANCER_NAME = os.getenv("BALANCER_NAME", "🇵🇱 Польша")
 PROBE_URL = os.getenv("PROBE_URL", "https://www.google.com/generate_204")
-PROBE_INTERVAL = os.getenv("PROBE_INTERVAL", "1m")
+PROBE_INTERVAL = os.getenv("PROBE_INTERVAL", "10s")
 
 
 def build_balancer_config(configs: list) -> dict:
@@ -95,7 +95,7 @@ def build_balancer_config(configs: list) -> dict:
                     "tag": "balancer",
                     "selector": balancer_selectors,
                     "strategy": {
-                        "type": "leastPing"
+                        "type": "random"
                     }
                 }
             ],
@@ -145,6 +145,9 @@ async def proxy_subscription(short_uuid: str, request: Request):
                 headers={
                     "User-Agent": user_agent,
                     "Accept": request.headers.get("Accept", "*/*"),
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "subs.pavuka.cv",
+                    "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
                 },
                 timeout=30.0
             )
@@ -199,6 +202,9 @@ async def proxy_subscription_path(short_uuid: str, path: str, request: Request):
                 headers={
                     "User-Agent": request.headers.get("User-Agent", ""),
                     "Accept": request.headers.get("Accept", "*/*"),
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "subs.pavuka.cv",
+                    "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
                 },
                 timeout=30.0
             )
