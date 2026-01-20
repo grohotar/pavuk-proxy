@@ -176,16 +176,12 @@ async def proxy_subscription(short_uuid: str, request: Request):
             balancer_config = build_balancer_config(configs)
             if balancer_config:
                 # Return as array with single config (Happ expects array)
-                # Copy headers from upstream response
-                headers = dict(upstream_response.headers)
-                headers.pop('content-length', None)  # Remove content-length as it will change
-                return JSONResponse(content=[balancer_config], headers=headers)
+                return JSONResponse(content=[balancer_config])
         
-        # Single config or failed - return as is with headers
+        # Single config or failed - return as is
         return Response(
             content=upstream_response.content,
-            media_type="application/json",
-            headers=dict(upstream_response.headers)
+            media_type="application/json"
         )
         
     except json.JSONDecodeError:
