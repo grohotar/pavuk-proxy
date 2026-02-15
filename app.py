@@ -43,6 +43,10 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+PROXY_GENERATED_RESPONSE_HEADERS = {
+    "date",
+    "server",
+}
 
 _group_rules_cache: dict[str, Any] = {
     "path": None,
@@ -62,7 +66,10 @@ def _extract_subscription_headers(upstream_response: httpx.Response) -> dict[str
 def _extract_passthrough_headers(upstream_response: httpx.Response) -> dict[str, str]:
     headers: dict[str, str] = {}
     for key, value in upstream_response.headers.items():
-        if key.lower() in HOP_BY_HOP_HEADERS:
+        lower_key = key.lower()
+        if lower_key in HOP_BY_HOP_HEADERS:
+            continue
+        if lower_key in PROXY_GENERATED_RESPONSE_HEADERS:
             continue
         headers[key] = value
     return headers
