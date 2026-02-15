@@ -10,6 +10,7 @@ import copy
 import re
 import asyncio
 import time
+import hashlib
 from pathlib import Path
 from typing import Any
 import httpx
@@ -25,6 +26,7 @@ PROBE_URL = os.getenv("PROBE_URL", "https://www.google.com/generate_204")
 PROBE_INTERVAL = os.getenv("PROBE_INTERVAL", "10s")
 FORWARDED_HOST = os.getenv("FORWARDED_HOST", "subs.pavuka.cv")
 DEFAULT_BALANCER_STRATEGY = os.getenv("DEFAULT_BALANCER_STRATEGY", "random")
+DEFAULT_GROUP_MODE = os.getenv("DEFAULT_GROUP_MODE", "sticky").strip().lower() or "sticky"
 GROUP_RULES_PATH = os.getenv("GROUP_RULES_PATH", "").strip()
 UPSTREAM_RETRIES = max(1, int(os.getenv("UPSTREAM_RETRIES", "3")))
 UPSTREAM_RETRY_DELAY_MS = max(0, int(os.getenv("UPSTREAM_RETRY_DELAY_MS", "150")))
@@ -259,6 +261,121 @@ def _extract_outbound_address(outbound: dict | None) -> str:
     return ""
 
 
+def _extract_outbound_user_key(outbound: dict | None) -> str:
+    """
+    Extract a stable user key from proxy outbound settings.
+    - vless/vmess: settings.vnext[0].users[0].id
+    - trojan/ss (best-effort): password fields
+    """
+    if not isinstance(outbound, dict):
+        return ""
+
+    settings = outbound.get("settings", {})
+    if not isinstance(settings, dict):
+        return ""
+
+    vnext = settings.get("vnext")
+    if isinstance(vnext, list) and vnext:
+        first = vnext[0]
+        if isinstance(first, dict):
+            users = first.get("users")
+            if isinstance(users, list) and users:
+                u0 = users[0]
+                if isinstance(u0, dict):
+                    user_id = u0.get("id")
+                    if isinstance(user_id, str) and user_id.strip():
+                        return user_id.strip()
+
+    servers = settings.get("servers")
+    if isinstance(servers, list) and servers:
+        first = servers[0]
+        if isinstance(first, dict):
+            password = first.get("password")
+            if isinstance(password, str) and password.strip():
+                return password.strip()
+
+    password = settings.get("password")
+    if isinstance(password, str) and password.strip():
+        return password.strip()
+
+    return ""
+
+
+def _derive_assignment_key(configs: list[dict], short_uuid: str, request: Request) -> str:
+    """
+    Stable key used for per-user node assignment inside a group.
+    Prefer user's UUID/password from the subscription config, then fall back to short_uuid.
+    """
+    for cfg in configs:
+        if not isinstance(cfg, dict):
+            continue
+        outbound = _extract_proxy_outbound(cfg)
+        key = _extract_outbound_user_key(outbound)
+        if key:
+            return key
+
+    if short_uuid:
+        return short_uuid
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "anonymous"
+
+
+def _normalize_group_mode(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    if not v:
+        v = DEFAULT_GROUP_MODE
+
+    if v in {"sticky", "per_user", "user", "hash", "hrw"}:
+        return "sticky"
+    if v in {"xray", "xray_balancer", "balancer", "client_balancer"}:
+        return "xray_balancer"
+
+    # Unknown value -> safe default.
+    return "sticky"
+
+
+def _hrw_pick_config(
+    candidates: list[dict],
+    *,
+    assignment_key: str,
+    group_name: str,
+) -> dict:
+    """
+    Pick one config deterministically for this user (Rendezvous/HRW hashing).
+    This gives near-even distribution and minimal churn when nodes are added/removed.
+    """
+    best_cfg: dict | None = None
+    best_score: int = -1
+
+    for cfg in candidates:
+        outbound = _extract_proxy_outbound(cfg)
+        node_key = _extract_outbound_address(outbound) or str(cfg.get("remarks") or "")
+        if not node_key:
+            # Last-resort, but keep deterministic-ish.
+            node_key = json.dumps(cfg, sort_keys=True)[:64]
+
+        h = hashlib.blake2s(digest_size=8)
+        h.update(assignment_key.encode("utf-8", errors="ignore"))
+        h.update(b"|")
+        h.update(group_name.encode("utf-8", errors="ignore"))
+        h.update(b"|")
+        h.update(node_key.encode("utf-8", errors="ignore"))
+        score = int.from_bytes(h.digest(), "big")
+
+        if score > best_score:
+            best_score = score
+            best_cfg = cfg
+
+    if best_cfg is None:
+        # Should never happen (len>=1), but keep it safe.
+        return candidates[0]
+
+    return best_cfg
+
+
 def _load_group_rules() -> list[dict]:
     if not GROUP_RULES_PATH:
         return []
@@ -318,6 +435,9 @@ def _load_group_rules() -> list[dict]:
                 "address_regex": [
                     x for x in address_regex if isinstance(x, str) and x.strip()
                 ],
+                "mode": _normalize_group_mode(
+                    item.get("mode") if isinstance(item.get("mode"), str) else None
+                ),
                 "strategy": (
                     item.get("strategy", DEFAULT_BALANCER_STRATEGY)
                     if isinstance(item.get("strategy"), str)
@@ -357,7 +477,12 @@ def _rule_matches(rule: dict, remark: str, address: str) -> bool:
     return False
 
 
-def _transform_configs_with_rules(configs: list[dict], rules: list[dict]) -> list[dict]:
+def _transform_configs_with_rules(
+    configs: list[dict],
+    rules: list[dict],
+    *,
+    assignment_key: str,
+) -> list[dict]:
     if not rules:
         return []
 
@@ -387,22 +512,37 @@ def _transform_configs_with_rules(configs: list[dict], rules: list[dict]) -> lis
         if len(matched) < 2:
             continue
 
-        balancer_config = build_balancer_config(
-            [item["config"] for item in matched],
-            balancer_name=rule["name"],
-            strategy=rule["strategy"] or DEFAULT_BALANCER_STRATEGY,
-            probe_url=rule["probe_url"] or PROBE_URL,
-            probe_interval=rule["probe_interval"] or PROBE_INTERVAL,
-        )
+        mode = rule.get("mode")
+        if not isinstance(mode, str):
+            mode = DEFAULT_GROUP_MODE
+        mode = _normalize_group_mode(mode)
 
-        if not balancer_config:
-            continue
+        group_configs = [item["config"] for item in matched]
+
+        if mode == "xray_balancer":
+            grouped = build_balancer_config(
+                group_configs,
+                balancer_name=rule["name"],
+                strategy=rule.get("strategy") or DEFAULT_BALANCER_STRATEGY,
+                probe_url=rule.get("probe_url") or PROBE_URL,
+                probe_interval=rule.get("probe_interval") or PROBE_INTERVAL,
+            )
+            if not grouped:
+                continue
+        else:
+            picked = _hrw_pick_config(
+                group_configs,
+                assignment_key=assignment_key,
+                group_name=rule["name"],
+            )
+            grouped = copy.deepcopy(picked)
+            grouped["remarks"] = rule["name"]
 
         for item in matched:
             consumed.add(item["idx"])
 
         first_idx = min(item["idx"] for item in matched)
-        output.append((first_idx, balancer_config))
+        output.append((first_idx, grouped))
 
     if not output:
         return []
@@ -584,22 +724,41 @@ async def proxy_subscription(short_uuid: str, request: Request):
             # Rules mode: if GROUP_RULES_PATH is configured, use selective grouping only.
             if GROUP_RULES_PATH:
                 group_rules = _load_group_rules()
-                transformed = _transform_configs_with_rules(configs, group_rules)
+                assignment_key = _derive_assignment_key(configs, short_uuid, request)
+                transformed = _transform_configs_with_rules(
+                    configs,
+                    group_rules,
+                    assignment_key=assignment_key,
+                )
                 if transformed:
                     return JSONResponse(content=transformed, headers=response_headers)
                 return JSONResponse(content=configs, headers=response_headers)
 
-            # Backward-compatible mode: if no rules configured, combine all.
+            # Legacy mode: if no rules configured, merge all into one entry.
             if len(configs) > 1:
-                balancer_config = build_balancer_config(
-                    configs,
-                    balancer_name=BALANCER_NAME,
-                    strategy=DEFAULT_BALANCER_STRATEGY,
-                    probe_url=PROBE_URL,
-                    probe_interval=PROBE_INTERVAL,
-                )
-                if balancer_config:
-                    return JSONResponse(content=[balancer_config], headers=response_headers)
+                mode = _normalize_group_mode(DEFAULT_GROUP_MODE)
+                if mode == "xray_balancer":
+                    balancer_config = build_balancer_config(
+                        configs,
+                        balancer_name=BALANCER_NAME,
+                        strategy=DEFAULT_BALANCER_STRATEGY,
+                        probe_url=PROBE_URL,
+                        probe_interval=PROBE_INTERVAL,
+                    )
+                    if balancer_config:
+                        return JSONResponse(
+                            content=[balancer_config], headers=response_headers
+                        )
+                else:
+                    assignment_key = _derive_assignment_key(configs, short_uuid, request)
+                    picked = _hrw_pick_config(
+                        configs,
+                        assignment_key=assignment_key,
+                        group_name=BALANCER_NAME,
+                    )
+                    grouped = copy.deepcopy(picked)
+                    grouped["remarks"] = BALANCER_NAME
+                    return JSONResponse(content=[grouped], headers=response_headers)
 
             return JSONResponse(content=configs, headers=response_headers)
 
