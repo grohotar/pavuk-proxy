@@ -68,11 +68,17 @@ def _extract_passthrough_headers(upstream_response: httpx.Response) -> dict[str,
     return headers
 
 
-def _build_upstream_request_headers(request: Request) -> dict[str, str]:
+def _build_upstream_request_headers(
+    request: Request, *, force_accept_html: bool = False
+) -> dict[str, str]:
+    accept = request.headers.get("Accept", "*/*")
+    if force_accept_html and (not accept or accept.strip() == "*/*"):
+        accept = "text/html"
+
     headers = {
         "Host": FORWARDED_HOST,
         "User-Agent": request.headers.get("User-Agent", ""),
-        "Accept": request.headers.get("Accept", "*/*"),
+        "Accept": accept,
         "Connection": "close",
         "X-Forwarded-Proto": "https",
         "X-Forwarded-Host": FORWARDED_HOST,
@@ -423,7 +429,10 @@ async def proxy_subscription(short_uuid: str, request: Request):
             upstream_response = await client.request(
                 request.method,
                 _build_upstream_url(short_uuid, request),
-                headers=_build_upstream_request_headers(request),
+                headers=_build_upstream_request_headers(
+                    request,
+                    force_accept_html=not is_happ,
+                ),
                 timeout=30.0,
             )
         except Exception as e:
