@@ -8,6 +8,7 @@ import os
 import json
 import copy
 import re
+import asyncio
 from pathlib import Path
 from typing import Any
 import httpx
@@ -24,6 +25,8 @@ PROBE_INTERVAL = os.getenv("PROBE_INTERVAL", "10s")
 FORWARDED_HOST = os.getenv("FORWARDED_HOST", "subs.pavuka.cv")
 DEFAULT_BALANCER_STRATEGY = os.getenv("DEFAULT_BALANCER_STRATEGY", "random")
 GROUP_RULES_PATH = os.getenv("GROUP_RULES_PATH", "").strip()
+UPSTREAM_RETRIES = max(1, int(os.getenv("UPSTREAM_RETRIES", "3")))
+UPSTREAM_RETRY_DELAY_MS = max(0, int(os.getenv("UPSTREAM_RETRY_DELAY_MS", "150")))
 
 PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks"}
 IMPORTANT_HEADERS = [
@@ -112,6 +115,46 @@ def _build_upstream_url(path: str, request: Request) -> str:
     if request.url.query:
         return f"{target}?{request.url.query}"
     return target
+
+
+async def _request_upstream_with_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+) -> httpx.Response:
+    last_error: Exception | None = None
+
+    for attempt in range(UPSTREAM_RETRIES):
+        try:
+            response = await client.request(
+                method,
+                url,
+                headers=headers,
+                timeout=30.0,
+            )
+            if response.status_code >= 500 and attempt < (UPSTREAM_RETRIES - 1):
+                await asyncio.sleep((UPSTREAM_RETRY_DELAY_MS / 1000.0) * (attempt + 1))
+                continue
+            return response
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+            httpx.WriteError,
+            httpx.WriteTimeout,
+        ) as exc:
+            last_error = exc
+            if attempt < (UPSTREAM_RETRIES - 1):
+                await asyncio.sleep((UPSTREAM_RETRY_DELAY_MS / 1000.0) * (attempt + 1))
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("upstream request failed")
 
 
 def _extract_proxy_outbound(config: dict) -> dict | None:
@@ -433,14 +476,14 @@ async def proxy_subscription(short_uuid: str, request: Request):
 
     async with httpx.AsyncClient() as client:
         try:
-            upstream_response = await client.request(
+            upstream_response = await _request_upstream_with_retries(
+                client,
                 request.method,
                 _build_upstream_url(short_uuid, request),
-                headers=_build_upstream_request_headers(
+                _build_upstream_request_headers(
                     request,
                     force_accept_html=not is_happ,
                 ),
-                timeout=30.0,
             )
         except Exception as e:
             return Response(status_code=502, content=f"Upstream error: {e}")
@@ -512,11 +555,11 @@ async def proxy_subscription_path(short_uuid: str, path: str, request: Request):
     """Proxy other subscription paths without transformation"""
     async with httpx.AsyncClient() as client:
         try:
-            upstream_response = await client.request(
+            upstream_response = await _request_upstream_with_retries(
+                client,
                 request.method,
                 _build_upstream_url(f"{short_uuid}/{path}", request),
-                headers=_build_upstream_request_headers(request),
-                timeout=30.0,
+                _build_upstream_request_headers(request),
             )
             return Response(
                 content=upstream_response.content,
