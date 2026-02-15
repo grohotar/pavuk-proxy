@@ -1,0 +1,4 @@
+services:
+  remnawave-nginx:
+    volumes:
+      - ./nginx.subscription-proxy.conf:/etc/nginx/conf.d/nginx.subscription-proxy.conf:ro

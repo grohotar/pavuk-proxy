@@ -19,6 +19,7 @@ wheels/
 .installed.cfg
 *.egg
 .env
+group-rules.json
 .venv
 env/
 venv/

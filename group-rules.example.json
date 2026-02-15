@@ -1,0 +1,13 @@
+{
+  "groups": [
+    {
+      "name": "🇩🇪 Германия",
+      "remarks": ["Germany1", "Germany2"],
+      "remark_regex": ["^Germany\\d+$", "^Германия\\s*\\d+$"],
+      "address_regex": ["^de\\d+\\.pavuka\\.cv$"],
+      "strategy": "random",
+      "probe_url": "https://www.google.com/generate_204",
+      "probe_interval": "10s"
+    }
+  ]
+}

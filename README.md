@@ -1,118 +1,152 @@
-# Subscription Proxy with Balancer
+# Subscription Proxy with Selective Balancer
 
-Прослойка для Remnawave панели, которая объединяет несколько Xray конфигов в один с балансировкой нагрузки.
+Прослойка для Remnawave subscription-page.
 
-## Что делает
+Что делает:
+- работает как отдельный Docker-контейнер;
+- для Happ может объединять только выбранные ноды (например `Germany1 + Germany2 -> Германия`);
+- не объединенные ноды отдает как есть (например `Poland` остается отдельной);
+- стандартную страницу подписки в браузере не ломает (HTML идет как раньше);
+- распределяет нагрузку внутри группы стратегией `random` (примерно поровну на дистанции).
 
-- Получает подписку от Remnawave (несколько серверов)
-- Объединяет их в один конфиг с `balancer` и `observatory`
-- Клиент (Happ) видит одну локацию вместо нескольких
-- Xray на клиенте сам выбирает лучший сервер и переключается при проблемах
+## Как это работает
 
-## Быстрая установка
+Поток:
 
-**1. Клонируй репо на сервер с панелью:**
+`Happ -> subs.domain -> nginx -> subscription-proxy -> remnawave-subscription-page`
+
+- Для `User-Agent` с `Happ` прокси читает JSON подписки и применяет правила группировки.
+- Для остальных клиентов/браузера прокси просто отдает upstream-ответ без трансформации.
+
+## Конфигурация
+
+Скопируй `.env.example` в `.env`:
+
+```bash
+cp .env.example .env
+```
+
+Основные переменные:
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `UPSTREAM_URL` | `http://127.0.0.1:3010` | remnawave subscription-page |
+| `APP_PORT` | `3020` | порт прокси |
+| `FORWARDED_HOST` | `subs.pavuka.cv` | `X-Forwarded-Host` для upstream |
+| `BALANCER_NAME` | `🇵🇱 Польша` | имя группы в legacy режиме (когда нет rules файла) |
+| `DEFAULT_BALANCER_STRATEGY` | `random` | стратегия балансировки |
+| `PROBE_URL` | `https://www.google.com/generate_204` | URL проверки доступности |
+| `PROBE_INTERVAL` | `10s` | интервал проверки |
+| `GROUP_RULES_PATH` | `/app/group-rules.json` | путь к JSON-правилам группировки |
+
+## Правила группировки
+
+Формат файла `group-rules.json`:
+
+```json
+{
+  "groups": [
+    {
+      "name": "🇩🇪 Германия",
+      "remarks": ["Germany1", "Germany2"],
+      "remark_regex": ["^Germany\\d+$"],
+      "address_regex": ["^de\\d+\\.pavuka\\.cv$"],
+      "strategy": "random",
+      "probe_url": "https://www.google.com/generate_204",
+      "probe_interval": "10s"
+    }
+  ]
+}
+```
+
+Правила:
+- `remarks`/`remark_regex`/`address_regex` работают по логике OR.
+- Если в группе найдено меньше 2 нод, группа не собирается.
+- Ноды, не попавшие ни в одну группу, остаются отдельными.
+- Если `GROUP_RULES_PATH` задан, прокси работает только в rules-режиме (селективная группировка).
+- Если `GROUP_RULES_PATH` пустой, включается legacy-режим: объединяются все ноды в одну запись `BALANCER_NAME`.
+
+## Запуск отдельного контейнера
+
 ```bash
 cd /opt
 git clone https://github.com/grohotar/pavuk-proxy.git subscription-proxy
 cd subscription-proxy
-```
-
-**2. Создай .env файл:**
-```bash
 cp .env.example .env
-nano .env  # отредактируй если нужно
+cp group-rules.example.json group-rules.json
 ```
 
-**3. Собери и запусти:**
+Пример запуска:
+
 ```bash
 docker build -t subscription-proxy:latest .
 docker run -d --name subscription-proxy --network host --restart always \
   --env-file .env \
+  -v /opt/subscription-proxy/group-rules.json:/app/group-rules.json:ro \
   subscription-proxy:latest
 ```
 
-**4. Обнови nginx конфиг** (см. ниже)
+## Интеграция с nginx Remnawave (через отдельный override-файл)
 
-## Конфигурация
+Чтобы не держать всю кастомизацию в основном `nginx.conf`:
 
-Скопируй `.env.example` в `.env` и настрой:
+1. Создай `docker-compose.override.yml` в `/opt/remnawave` (можно взять `remnawave-docker-compose.override.example.yml`):
 
-```bash
-cp .env.example .env
+```yaml
+services:
+  remnawave-nginx:
+    volumes:
+      - ./nginx.subscription-proxy.conf:/etc/nginx/conf.d/nginx.subscription-proxy.conf:ro
 ```
 
-Параметры в `.env`:
-
-| Переменная | По умолчанию | Описание |
-|------------|--------------|----------|
-| `UPSTREAM_URL` | `http://127.0.0.1:3010` | URL remnawave subscription-page |
-| `BALANCER_NAME` | `🇵🇱 Польша` | Название локации в клиенте |
-| `APP_PORT` | `3020` | Порт прослойки |
-| `PROBE_URL` | `https://www.google.com/generate_204` | URL для проверки доступности |
-| `PROBE_INTERVAL` | `10s` | Интервал проверки (5s-10s рекомендуется) |
-
-## Nginx конфигурация
-
-Добавь в `/opt/remnawave/nginx.conf`:
+2. Создай `/opt/remnawave/nginx.subscription-proxy.conf` (можно взять `nginx.subscription-proxy.conf.example`):
 
 ```nginx
-# Upstream для subscription-proxy
 upstream subscription_proxy {
     server 127.0.0.1:3020;
 }
-
-# Измени server для subs.your-domain.com
-server {
-    server_name subs.your-domain.com;
-    listen 443 ssl;
-    http2 on;
-
-    ssl_certificate "/etc/nginx/ssl/subs.your-domain.com/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/subs.your-domain.com/privkey.pem";
-
-    location / {
-        proxy_http_version 1.1;
-        proxy_pass http://subscription_proxy;  # ← через прослойку
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host $host;
-        # ... остальные заголовки
-    }
-}
 ```
 
-Перезапусти nginx:
-```bash
-docker restart remnawave-nginx
+3. В `/opt/remnawave/nginx.conf`:
+- добавь include рядом с upstream-блоками:
+
+```nginx
+include /etc/nginx/conf.d/nginx.subscription-proxy.conf;
 ```
 
-## Обновление
+- в `server_name subs...` поменяй только `proxy_pass`:
+
+```nginx
+proxy_pass http://subscription_proxy;
+```
+
+4. Примени изменения:
 
 ```bash
-cd /opt/subscription-proxy
-git pull
-docker build -t subscription-proxy:latest .
-docker stop subscription-proxy && docker rm subscription-proxy
-docker run -d --name subscription-proxy --network host --restart always \
-  --env-file .env \
-  subscription-proxy:latest
+cd /opt/remnawave
+docker compose up -d remnawave-nginx
 ```
 
-## Как работает
+После этого:
+- браузерная страница подписки продолжит открываться как раньше;
+- Happ будет получать трансформированную выдачу по правилам группировки.
 
+## Проверка
+
+```bash
+curl -sS http://127.0.0.1:3020/health
 ```
-Happ → subs.domain.com → nginx → subscription-proxy
-                                        ↓
-                           remnawave-subscription-page:3010
-                                        ↓
-                              [Poland1, Poland2, ...]
-                                        ↓
-                           subscription-proxy объединяет
-                           в один конфиг с balancer
-                                        ↓
-                                     Happ
-                              видит одну "Польша"
+
+Проверка Happ-выдачи:
+
+```bash
+curl -k -sS -A 'Happ/4.2.5/ios' "https://subs.your-domain.com/<short_uuid>"
+```
+
+Проверка браузерной выдачи:
+
+```bash
+curl -k -sS -A 'Mozilla/5.0' "https://subs.your-domain.com/<short_uuid>"
 ```
 
 ## License
