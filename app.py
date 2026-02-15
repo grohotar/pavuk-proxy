@@ -33,6 +33,16 @@ IMPORTANT_HEADERS = [
     "profile-web-page-url",
     "support-url",
 ]
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
 
 _group_rules_cache: dict[str, Any] = {
     "path": None,
@@ -47,6 +57,45 @@ def _extract_subscription_headers(upstream_response: httpx.Response) -> dict[str
         if header_name in upstream_response.headers:
             headers[header_name] = upstream_response.headers[header_name]
     return headers
+
+
+def _extract_passthrough_headers(upstream_response: httpx.Response) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in upstream_response.headers.items():
+        if key.lower() in HOP_BY_HOP_HEADERS:
+            continue
+        headers[key] = value
+    return headers
+
+
+def _build_upstream_request_headers(request: Request) -> dict[str, str]:
+    headers = {
+        "User-Agent": request.headers.get("User-Agent", ""),
+        "Accept": request.headers.get("Accept", "*/*"),
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": FORWARDED_HOST,
+        "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
+    }
+
+    # Required for subscription-page static assets and session validation.
+    cookie = request.headers.get("Cookie")
+    if cookie:
+        headers["Cookie"] = cookie
+
+    referer = request.headers.get("Referer")
+    if referer:
+        headers["Referer"] = referer
+
+    return headers
+
+
+def _build_upstream_url(path: str, request: Request) -> str:
+    normalized_path = path.lstrip("/")
+    base = UPSTREAM_URL.rstrip("/")
+    target = f"{base}/{normalized_path}" if normalized_path else base
+    if request.url.query:
+        return f"{target}?{request.url.query}"
+    return target
 
 
 def _extract_proxy_outbound(config: dict) -> dict | None:
@@ -357,7 +406,7 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/{short_uuid}")
+@app.api_route("/{short_uuid}", methods=["GET", "HEAD"])
 async def proxy_subscription(short_uuid: str, request: Request):
     """Proxy subscription request and transform to balancer config"""
 
@@ -368,16 +417,11 @@ async def proxy_subscription(short_uuid: str, request: Request):
 
     async with httpx.AsyncClient() as client:
         try:
-            upstream_response = await client.get(
-                f"{UPSTREAM_URL}/{short_uuid}",
-                headers={
-                    "User-Agent": user_agent,
-                    "Accept": request.headers.get("Accept", "*/*"),
-                    "X-Forwarded-Proto": "https",
-                    "X-Forwarded-Host": FORWARDED_HOST,
-                    "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
-                },
-                timeout=30.0
+            upstream_response = await client.request(
+                request.method,
+                _build_upstream_url(short_uuid, request),
+                headers=_build_upstream_request_headers(request),
+                timeout=30.0,
             )
         except Exception as e:
             return Response(status_code=502, content=f"Upstream error: {e}")
@@ -385,14 +429,18 @@ async def proxy_subscription(short_uuid: str, request: Request):
     if upstream_response.status_code != 200:
         return Response(
             status_code=upstream_response.status_code,
-            content=upstream_response.content
+            content=upstream_response.content,
+            media_type=upstream_response.headers.get("content-type"),
+            headers=_extract_passthrough_headers(upstream_response),
         )
 
-    # If not Happ - return as is
-    if not is_happ:
+    # HEAD and non-Happ clients must be proxied as-is with full headers/cookies.
+    if request.method != "GET" or not is_happ:
         return Response(
             content=upstream_response.content,
-            media_type=upstream_response.headers.get("content-type", "text/plain")
+            status_code=upstream_response.status_code,
+            media_type=upstream_response.headers.get("content-type", "text/plain"),
+            headers=_extract_passthrough_headers(upstream_response),
         )
 
     response_headers = _extract_subscription_headers(upstream_response)
@@ -440,26 +488,22 @@ async def proxy_subscription(short_uuid: str, request: Request):
         )
 
 
-@app.get("/{short_uuid}/{path:path}")
+@app.api_route("/{short_uuid}/{path:path}", methods=["GET", "HEAD"])
 async def proxy_subscription_path(short_uuid: str, path: str, request: Request):
     """Proxy other subscription paths without transformation"""
     async with httpx.AsyncClient() as client:
         try:
-            upstream_response = await client.get(
-                f"{UPSTREAM_URL}/{short_uuid}/{path}",
-                headers={
-                    "User-Agent": request.headers.get("User-Agent", ""),
-                    "Accept": request.headers.get("Accept", "*/*"),
-                    "X-Forwarded-Proto": "https",
-                    "X-Forwarded-Host": FORWARDED_HOST,
-                    "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
-                },
-                timeout=30.0
+            upstream_response = await client.request(
+                request.method,
+                _build_upstream_url(f"{short_uuid}/{path}", request),
+                headers=_build_upstream_request_headers(request),
+                timeout=30.0,
             )
             return Response(
                 content=upstream_response.content,
                 status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get("content-type")
+                media_type=upstream_response.headers.get("content-type"),
+                headers=_extract_passthrough_headers(upstream_response),
             )
         except Exception as e:
             return Response(status_code=502, content=f"Upstream error: {e}")
