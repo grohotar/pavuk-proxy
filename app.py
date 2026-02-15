@@ -9,6 +9,7 @@ import json
 import copy
 import re
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 import httpx
@@ -27,6 +28,9 @@ DEFAULT_BALANCER_STRATEGY = os.getenv("DEFAULT_BALANCER_STRATEGY", "random")
 GROUP_RULES_PATH = os.getenv("GROUP_RULES_PATH", "").strip()
 UPSTREAM_RETRIES = max(1, int(os.getenv("UPSTREAM_RETRIES", "3")))
 UPSTREAM_RETRY_DELAY_MS = max(0, int(os.getenv("UPSTREAM_RETRY_DELAY_MS", "150")))
+ASSET_COOKIE_SAFETY_MARGIN_SECONDS = max(
+    0, int(os.getenv("ASSET_COOKIE_SAFETY_MARGIN_SECONDS", "15"))
+)
 
 PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks"}
 IMPORTANT_HEADERS = [
@@ -56,6 +60,45 @@ _group_rules_cache: dict[str, Any] = {
     "mtime": None,
     "rules": [],
 }
+_asset_cookie_cache: dict[str, Any] = {
+    "cookie": None,
+    "expires_at": 0.0,
+}
+
+
+def _cache_asset_cookie_from_set_cookie(set_cookie_value: str) -> None:
+    if not set_cookie_value:
+        return
+
+    cookie = set_cookie_value.split(";", 1)[0].strip()
+    if not cookie or "=" not in cookie:
+        return
+
+    max_age_seconds: int | None = None
+    m = re.search(r"(?i)\\bmax-age=(\\d+)\\b", set_cookie_value)
+    if m:
+        try:
+            max_age_seconds = int(m.group(1))
+        except ValueError:
+            max_age_seconds = None
+
+    now = time.time()
+    if max_age_seconds is not None and max_age_seconds > 0:
+        expires_at = now + max(0, max_age_seconds - ASSET_COOKIE_SAFETY_MARGIN_SECONDS)
+    else:
+        # Fallback TTL if upstream didn't provide Max-Age (should not happen).
+        expires_at = now + 25 * 60
+
+    _asset_cookie_cache["cookie"] = cookie
+    _asset_cookie_cache["expires_at"] = expires_at
+
+
+def _get_cached_asset_cookie() -> str | None:
+    cookie = _asset_cookie_cache.get("cookie")
+    expires_at = float(_asset_cookie_cache.get("expires_at") or 0.0)
+    if not cookie or time.time() >= expires_at:
+        return None
+    return cookie
 
 
 def _extract_subscription_headers(upstream_response: httpx.Response) -> dict[str, str]:
@@ -106,6 +149,16 @@ def _build_upstream_request_headers(
         headers["Referer"] = referer
 
     return headers
+
+
+def _inject_cookie_if_missing(headers: dict[str, str], cookie: str | None) -> None:
+    if not cookie:
+        return
+    # Static assets in Remnawave subscription-page can require a session cookie,
+    # but module/script/link requests may be sent without cookies. We only use a
+    # cached cookie as a fallback for such requests.
+    if "Cookie" not in headers:
+        headers["Cookie"] = cookie
 
 
 def _build_upstream_url(path: str, request: Request) -> str:
@@ -487,6 +540,11 @@ async def proxy_subscription(short_uuid: str, request: Request):
             )
         except Exception as e:
             return Response(status_code=502, content=f"Upstream error: {e}")
+
+    # Cache session cookie from the HTML page response for later /assets requests.
+    for v in upstream_response.headers.get_list("set-cookie"):
+        _cache_asset_cookie_from_set_cookie(v)
+        break
     
     if upstream_response.status_code != 200:
         return Response(
@@ -555,11 +613,15 @@ async def proxy_subscription_path(short_uuid: str, path: str, request: Request):
     """Proxy other subscription paths without transformation"""
     async with httpx.AsyncClient() as client:
         try:
+            headers = _build_upstream_request_headers(request)
+            if short_uuid == "assets":
+                _inject_cookie_if_missing(headers, _get_cached_asset_cookie())
+
             upstream_response = await _request_upstream_with_retries(
                 client,
                 request.method,
                 _build_upstream_url(f"{short_uuid}/{path}", request),
-                _build_upstream_request_headers(request),
+                headers,
             )
             return Response(
                 content=upstream_response.content,
