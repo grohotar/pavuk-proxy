@@ -91,6 +91,10 @@ docker run -d --name subscription-proxy --network host --restart always \
   subscription-proxy:latest
 ```
 
+Примечание для продакшена (без завязки на host-порты Remnawave):
+- подключи контейнер прокси к docker-сети Remnawave (обычно `remnawave_default`) и укажи `UPSTREAM_URL` на имя сервиса, например `http://remnawave-subscription-page:80`;
+- в nginx Remnawave проксируй на `subscription-proxy:3020` (по имени контейнера в той же сети), тогда host-порты можно вообще не трогать.
+
 ## Интеграция с nginx Remnawave (через отдельный override-файл)
 
 Чтобы не держать всю кастомизацию в основном `nginx.conf`:
