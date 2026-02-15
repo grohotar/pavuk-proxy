@@ -54,6 +54,13 @@ PROXY_GENERATED_RESPONSE_HEADERS = {
     "date",
     "server",
 }
+DECODE_SENSITIVE_HEADERS = {
+    # httpx может распаковывать body (gzip/deflate/br), но заголовки остаются.
+    # Если отдать распакованный body + исходный Content-Encoding, браузер
+    # падает с ERR_CONTENT_DECODING_FAILED.
+    "content-encoding",
+    "content-length",
+}
 
 _group_rules_cache: dict[str, Any] = {
     "path": None,
@@ -117,6 +124,8 @@ def _extract_passthrough_headers(upstream_response: httpx.Response) -> dict[str,
             continue
         if lower_key in PROXY_GENERATED_RESPONSE_HEADERS:
             continue
+        if lower_key in DECODE_SENSITIVE_HEADERS:
+            continue
         headers[key] = value
     return headers
 
@@ -132,6 +141,8 @@ def _build_upstream_request_headers(
         "Host": FORWARDED_HOST,
         "User-Agent": request.headers.get("User-Agent", ""),
         "Accept": accept,
+        # Avoid upstream compression to prevent Content-Encoding/body mismatches.
+        "Accept-Encoding": "identity",
         "Connection": "close",
         "X-Forwarded-Proto": "https",
         "X-Forwarded-Host": FORWARDED_HOST,
