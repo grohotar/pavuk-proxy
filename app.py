@@ -70,10 +70,13 @@ def _extract_passthrough_headers(upstream_response: httpx.Response) -> dict[str,
 
 def _build_upstream_request_headers(request: Request) -> dict[str, str]:
     headers = {
+        "Host": FORWARDED_HOST,
         "User-Agent": request.headers.get("User-Agent", ""),
         "Accept": request.headers.get("Accept", "*/*"),
+        "Connection": "close",
         "X-Forwarded-Proto": "https",
         "X-Forwarded-Host": FORWARDED_HOST,
+        "X-Forwarded-Port": "443",
         "X-Forwarded-For": request.client.host if request.client else "127.0.0.1",
     }
 
