@@ -575,7 +575,9 @@ def build_balancer_config(
 
     # Extract proxy outbounds from each config
     for i, config in enumerate(configs):
-        tag = f"proxy_{i+1}"
+        # Keep the first outbound tag as "proxy" for client compatibility
+        # (some clients expect a canonical proxy tag for latency test UI).
+        tag = "proxy" if i == 0 else f"proxy_{i+1}"
 
         outbound = _extract_proxy_outbound(config)
         if outbound:
